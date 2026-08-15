@@ -35,20 +35,12 @@ from .coordinator import BlancoUnitCoordinator
 _LOGGER = logging.getLogger(__name__)
 
 # Service schemas
-def _validate_amount_ml(value: int) -> int:
-    """Validate amount is a multiple of 100."""
-    if value % 100 != 0:
-        raise vol.Invalid("Amount must be a multiple of 100ml")
-    return value
-
-
 SERVICE_DISPENSE_WATER_SCHEMA = vol.Schema(
     {
         vol.Required(HA_SERVICE_ATTR_DEVICE_ID): cv.string,
         vol.Required(HA_SERVICE_ATTR_AMOUNT_ML): vol.All(
             vol.Coerce(int),
-            vol.Range(min=100, max=1500),
-            _validate_amount_ml,
+            vol.Range(min=50, max=1500),
         ),
         vol.Required(HA_SERVICE_ATTR_CO2_INTENSITY): vol.All(
             vol.Coerce(int), vol.In([1, 2, 3])

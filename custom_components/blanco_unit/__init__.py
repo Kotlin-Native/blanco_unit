@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import logging
 
+from bleak import BleakClient
 from bleak.backends.device import BLEDevice
-from bleak_retry_connector import BleakClientWithServiceCache, establish_connection
+from bleak_retry_connector import establish_connection
 from packaging import version
 
 from homeassistant.components import bluetooth
@@ -27,13 +28,13 @@ from homeassistant.exceptions import (
 from .client import validate_pin
 from .const import (
     BLE_CALLBACK,
-    CHARACTERISTIC_UUID,
     CONF_DEV_ID,
     CONF_MAC,
     CONF_PIN,
     DOMAIN,
     MIN_HA_VERSION,
     RANDOM_MAC_PLACEHOLDER,
+    SERVICE_UUID,
 )
 from .coordinator import BlancoUnitCoordinator
 from .services import async_setup_services
@@ -71,7 +72,7 @@ def _is_random_mac(config_entry: BlancoUnitConfigEntry) -> bool:
 async def _find_device_by_scanning(
     hass: HomeAssistant, pin: str, expected_dev_id: str
 ) -> BLEDevice:
-    """Find a BLE device by active scanning for CHARACTERISTIC_UUID and matching PIN + dev_id.
+    """Find a BLE device by active scanning for SERVICE_UUID and matching PIN + dev_id.
 
     Uses the shared HA BLE scanner to actively scan for devices that advertise
     the Blanco Unit service UUID, sorts them by RSSI (closest first),
@@ -84,17 +85,17 @@ async def _find_device_by_scanning(
     scanner = bluetooth.async_get_scanner(hass)
     discovered = scanner.discovered_devices_and_advertisement_data
 
-    # Filter by CHARACTERISTIC_UUID and sort by RSSI (closest first)
+    # Filter by the advertised SERVICE_UUID and sort by RSSI (closest first)
     candidates: list[tuple[BLEDevice, int]] = []
     for device, adv_data in discovered.values():
-        if CHARACTERISTIC_UUID in adv_data.service_uuids:
+        if SERVICE_UUID in adv_data.service_uuids:
             candidates.append((device, adv_data.rssi))
     candidates.sort(key=lambda item: item[1], reverse=True)
 
     _LOGGER.debug(
         "Random MAC scan: found %d candidates with UUID %s",
         len(candidates),
-        CHARACTERISTIC_UUID,
+        SERVICE_UUID,
     )
 
     if not candidates:
@@ -111,7 +112,7 @@ async def _find_device_by_scanning(
         client = None
         try:
             client = await establish_connection(
-                client_class=BleakClientWithServiceCache,
+                client_class=BleakClient,
                 device=device,
                 name=device.name or "Unknown Device",
             )
@@ -189,7 +190,7 @@ def _register_retry_callback(
         unregister_ble_callback = bluetooth.async_register_callback(
             hass,
             _available_callback,
-            {"service_uuid": CHARACTERISTIC_UUID, "connectable": True},
+            {"service_uuid": SERVICE_UUID, "connectable": True},
             BluetoothScanningMode.ACTIVE,
         )
     else:
@@ -299,7 +300,7 @@ async def async_reload_entry(
 ) -> None:
     """Reload config entry."""
     _LOGGER.debug(
-        "async_reload_entry async_reload with pin %s", config_entry.data["conf_pin"]
+        "async_reload_entry async_reload for %s", config_entry.entry_id
     )
     await async_unload_entry(hass, config_entry)
     await async_setup_entry(hass, config_entry)
@@ -325,5 +326,33 @@ async def async_unload_entry(
         await coordinator.unload()
         if not _is_random_mac(config_entry):
             bluetooth.async_rediscover_address(hass, config_entry.data[CONF_MAC])
+        # Clean up entry data
+        hass.data[DOMAIN].pop(config_entry.entry_id, None)
 
     return unload_ok
+
+
+async def async_remove_entry(
+    hass: HomeAssistant, config_entry: BlancoUnitConfigEntry
+) -> None:
+    """Handle full removal of a config entry.
+
+    The BlueZ bond is intentionally left intact.  The Blanco unit keeps
+    its side of the bond after the integration is removed, so wiping only
+    the host-side keys would create an asymmetric bond: the host forgets
+    the device while the device still considers itself bonded.  Re-adding
+    the integration then has to re-pair from scratch, which the device
+    can refuse while it is still bonded — leaving it impossible to
+    reconnect (the exact "deleted once, can't reconnect" failure).
+
+    Keeping the host bond lets a later re-add reuse the existing pairing
+    and reconnect cleanly.  The rare case where the device-side bond is
+    invalidated externally (factory reset or re-pair via the Blanco app)
+    is recovered at runtime by the client's force-repair path
+    (BlancoUnitBluetoothClient._force_repair).
+    """
+    _LOGGER.debug(
+        "async_remove_entry for %s: keeping BlueZ bond so a later re-add "
+        "can reconnect without re-pairing",
+        config_entry.data.get(CONF_MAC),
+    )

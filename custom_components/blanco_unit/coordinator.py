@@ -5,6 +5,7 @@ from collections.abc import Callable
 from dataclasses import replace
 from datetime import timedelta
 import logging
+import time
 from typing import Any
 
 from bleak.backends.device import BLEDevice
@@ -23,11 +24,11 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 
 from .client import BlancoUnitAuthenticationError, BlancoUnitBluetoothClient
 from .const import (
-    CHARACTERISTIC_UUID,
     CONF_MAC,
     CONF_PIN,
     DOMAIN,
     RANDOM_MAC_PLACEHOLDER,
+    SERVICE_UUID,
 )
 from .data import BlancoUnitData, BlancoUnitWifiNetwork
 
@@ -77,6 +78,9 @@ class BlancoUnitCoordinator(DataUpdateCoordinator[BlancoUnitData]):
 
         # Setup listeners
         self._unsub_options_update_listener = unsub_options_update_listener
+        self._last_refresh_time: float = 0.0
+        self._last_wifi_fetch: float = 0.0
+        self._wifi_fetch_interval: float = 30 * 60  # 30 minutes
         self._unsub_unavailable_update_listener = bluetooth.async_track_unavailable(
             hass, self._unavailable_callback, self.address, connectable=True
         )
@@ -85,7 +89,7 @@ class BlancoUnitCoordinator(DataUpdateCoordinator[BlancoUnitData]):
             self._unsub_available_update_listener = bluetooth.async_register_callback(
                 hass,
                 self._available_callback,
-                {"service_uuid": CHARACTERISTIC_UUID, "connectable": True},
+                {"service_uuid": SERVICE_UUID, "connectable": True},
                 BluetoothScanningMode.ACTIVE,
             )
         else:
@@ -102,15 +106,23 @@ class BlancoUnitCoordinator(DataUpdateCoordinator[BlancoUnitData]):
         self, info: BluetoothServiceInfoBleak, change: BluetoothChange
     ) -> None:
         _LOGGER.debug("%s is discovered again", info.address)
-        self.hass.async_create_task(self.async_request_refresh())  # load the data
+        # Always update the BLE device reference so connect uses fresh advert data
+        self._client.update_device(info.device)
+        self.address = info.address
+        # Only trigger a refresh if we have no data yet or it's been >30s
+        # to avoid hammering the device on every BLE advertisement.
+        now = time.monotonic()
+        if self.data is None or (now - self._last_refresh_time) > 30:
+            self._last_refresh_time = now
+            self.hass.async_create_task(self.async_request_refresh())
 
     def _unavailable_callback(self, info: BluetoothServiceInfoBleak) -> None:
-        _LOGGER.debug("%s is no longer seen", info.address)
+        _LOGGER.warning("%s is no longer seen via BLE", info.address)
         self._set_unavailable()
 
     async def unload(self) -> None:
         """Disconnect and unload."""
-        _LOGGER.debug("unload coordinator")
+        _LOGGER.info("Unloading coordinator for %s", self.address)
         self._unsub_unavailable_update_listener()
         self._unsub_available_update_listener()
         await self._client.disconnect()
@@ -212,7 +224,12 @@ class BlancoUnitCoordinator(DataUpdateCoordinator[BlancoUnitData]):
 
     def _connection_changed(self, connected: bool) -> None:
         if self.data is not None:
-            self.async_set_updated_data(replace(self.data, connected=connected))
+            # Called from bleak's disconnect callback thread —
+            # schedule on the event loop to avoid thread-safety issues.
+            self.hass.loop.call_soon_threadsafe(
+                self.async_set_updated_data,
+                replace(self.data, connected=connected),
+            )
 
     # -------------------------------
     # region WiFi & Device Management
@@ -268,14 +285,71 @@ class BlancoUnitCoordinator(DataUpdateCoordinator[BlancoUnitData]):
     # -------------------------------
 
     async def _async_update_data(self) -> BlancoUnitData:
-        """Fetch data from device."""
+        """Fetch data from device.
+
+        Polling strategy to reduce BLE traffic:
+        - settings + status:   every poll (1 minute) — these change frequently
+        - wifi_info:           every 30 minutes — rarely changes
+        - system_info:         once on init / after reconnect — static info
+        - identity:            once on init / after reconnect — static info
+        """
+        # Always use the freshest BLE device reference from HA's scanner
+        fresh = bluetooth.async_ble_device_from_address(
+            self.hass, self.address, connectable=True
+        )
+        if fresh is not None:
+            self._client.update_device(fresh)
+        else:
+            _LOGGER.debug(
+                "No fresh BLE device for %s, using cached reference", self.address
+            )
+
+        is_first_poll = self.data is None
+        now = time.monotonic()
+
         try:
+            poll_start = time.monotonic()
+
+            # --- Always fetch: settings + status (2 transactions) ---
+            _LOGGER.debug("Fetching settings from device")
+            settings = await self._client.get_settings()
+            _LOGGER.debug("Fetching status from device")
+            status = await self._client.get_status()
+
+            # --- Fetch on init only: system_info + identity ---
+            if is_first_poll:
+                _LOGGER.info(
+                    "First poll for %s — fetching system_info and identity",
+                    self.address,
+                )
+                system_info = await self._client.get_system_info()
+                identity = await self._client.get_device_identity()
+            else:
+                system_info = self.data.system_info
+                identity = self.data.identity
+
+            # --- Fetch every 30 minutes: wifi_info ---
+            if is_first_poll or (now - self._last_wifi_fetch) >= self._wifi_fetch_interval:
+                _LOGGER.debug("Fetching wifi_info (interval elapsed or first poll)")
+                wifi_info = await self._client.get_wifi_info()
+                self._last_wifi_fetch = now
+            else:
+                wifi_info = self.data.wifi_info
+
+            poll_duration = time.monotonic() - poll_start
+            _LOGGER.debug(
+                "Poll completed in %.1fs (first=%s, wifi_refreshed=%s)",
+                poll_duration,
+                is_first_poll,
+                is_first_poll or (now - self._last_wifi_fetch) < 1,
+            )
+
             return BlancoUnitData(
-                system_info=await self._client.get_system_info(),
-                settings=await self._client.get_settings(),
-                status=await self._client.get_status(),
-                identity=await self._client.get_device_identity(),
-                wifi_info=await self._client.get_wifi_info(),
+                system_info=system_info,
+                settings=settings,
+                status=status,
+                identity=identity,
+                wifi_info=wifi_info,
                 connected=self._client.is_connected,
                 available=True,
                 device_id=self._client.device_id or "",
@@ -283,21 +357,26 @@ class BlancoUnitCoordinator(DataUpdateCoordinator[BlancoUnitData]):
             )
         except BlancoUnitAuthenticationError as err:
             self._set_unavailable()
-            # reraise auth issues
-            _LOGGER.debug("_async_update_data ConfigEntryAuthFailed %s", str(err))
+            _LOGGER.warning(
+                "Authentication failed during poll for %s: %s", self.address, err
+            )
             raise ConfigEntryAuthFailed from err
         except BleakConnectionError as err:
-            # treat BleakConnectionError as device not found
+            _LOGGER.warning(
+                "BLE connection error during poll for %s: %s", self.address, err
+            )
             raise UpdateFailed(translation_key="error_device_not_found") from err
         except BleakNotFoundError as err:
-            _LOGGER.debug("_async_update_data BleakNotFoundError %s", str(err))
+            _LOGGER.warning(
+                "Device %s not found during poll: %s", self.address, err
+            )
             self._set_unavailable()
-            # treat BleakNotFoundError as device not found
             raise UpdateFailed(translation_key="error_device_not_found") from err
         except Exception as err:
-            _LOGGER.debug("_async_update_data Exception %s", repr(err))
+            _LOGGER.warning(
+                "Unexpected error during poll for %s: %r", self.address, err
+            )
             self._set_unavailable()
-            # Device unreachable → tell HA gracefully
             raise UpdateFailed(
                 translation_key="error_unknown",
                 translation_placeholders={"error": repr(err)},
@@ -305,37 +384,45 @@ class BlancoUnitCoordinator(DataUpdateCoordinator[BlancoUnitData]):
 
     async def _call(self, func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
         """Execute a BLE client call safely."""
+        func_name = getattr(func, "__name__", repr(func))
+        _LOGGER.debug("Calling %s for %s", func_name, self.address)
         try:
             return await func(*args, **kwargs)
         except BlancoUnitAuthenticationError as err:
-            # reraise auth issues
-            _LOGGER.debug("_call ConfigEntryAuthFailed %s", str(err))
+            _LOGGER.warning(
+                "%s: authentication failed for %s: %s", func_name, self.address, err
+            )
             raise ConfigEntryAuthFailed from err
         except BleakConnectionError as err:
-            _LOGGER.debug("BleakConnectionError Exception %s", repr(err))
+            _LOGGER.warning(
+                "%s: BLE connection error for %s: %s", func_name, self.address, err
+            )
             self._set_unavailable()
-            # treat BleakConnectionError as device not found
             raise ServiceValidationError(
                 translation_key="error_device_not_found"
             ) from err
         except BleakNotFoundError as err:
-            _LOGGER.debug("_call BleakNotFoundError %s", str(err))
+            _LOGGER.warning(
+                "%s: device %s not found: %s", func_name, self.address, err
+            )
             self._set_unavailable()
-            # treat BleakNotFoundError as device not found
             raise ServiceValidationError(
                 translation_key="error_device_not_found"
             ) from err
         except Exception as err:
-            _LOGGER.debug("_call Exception %s", repr(err))
+            _LOGGER.warning(
+                "%s: unexpected error for %s: %r", func_name, self.address, err
+            )
             self._set_unavailable()
-            # Device unreachable → tell HA gracefully
             raise ServiceValidationError(
                 translation_key="error_unknown",
                 translation_placeholders={"error": repr(err)},
             ) from err
 
     def _set_unavailable(self) -> None:
-        _LOGGER.debug("_set_unavailable with data %s", str(self.data))
+        _LOGGER.warning(
+            "Marking %s as unavailable (had_data=%s)", self.address, self.data is not None
+        )
         # trigger rediscovery for the device (only for static MAC)
         if not self._random_mac:
             bluetooth.async_rediscover_address(self.hass, self.mac_address)

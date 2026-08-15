@@ -35,6 +35,8 @@
       "invalid_pin_format": "PIN must be exactly 5 digits (00000-99999).",
       "error_device_not_found": "Device not found. Please ensure the Blanco Unit is powered on and in Bluetooth range.",
       "error_invalid_authentication": "Authentication failed. Please check that the PIN is correct.",
+      "error_pairing_failed": "BLE pairing failed. Please check the pairing code and ensure the device is powered on and in range.",
+      "invalid_pairing_code": "Pairing code must be a numeric value (typically the last 5 digits of the serial number).",
       "error_unknown": "Failed to connect to the device: {error}"
     },
     "abort": {
@@ -78,6 +80,13 @@
           "conf_mac": "MAC Address",
           "conf_name": "Device Name",
           "conf_pin": "PIN (5 digits)"
+        }
+      },
+      "pairing": {
+        "title": "BLE Pairing Required",
+        "description": "The device {name} requires Bluetooth pairing before it can be used. Enter the BLE pairing code — this is typically the last 5 digits of the serial number printed on the device.",
+        "data": {
+          "pairing_code": "Pairing Code"
         }
       }
     }

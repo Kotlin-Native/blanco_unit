@@ -16,12 +16,12 @@ from custom_components.blanco_unit import (
 from custom_components.blanco_unit.client import PinValidationResult
 from custom_components.blanco_unit.const import (
     BLE_CALLBACK,
-    CHARACTERISTIC_UUID,
     CONF_DEV_ID,
     CONF_MAC,
     CONF_PIN,
     DOMAIN,
     RANDOM_MAC_PLACEHOLDER,
+    SERVICE_UUID,
 )
 from homeassistant.components.bluetooth import (
     BluetoothChange,
@@ -462,7 +462,7 @@ def _make_discovered_device(
     device.name = f"Device_{address}"
 
     adv_data = MagicMock()
-    adv_data.service_uuids = [CHARACTERISTIC_UUID]
+    adv_data.service_uuids = [SERVICE_UUID]
     adv_data.rssi = rssi
 
     return device, adv_data
@@ -772,7 +772,7 @@ async def test_register_retry_callback_random_mac(hass: HomeAssistant) -> None:
         # Second argument is the filter dict
         filter_dict = call_args[0][2]
         assert "service_uuid" in filter_dict
-        assert filter_dict["service_uuid"] == CHARACTERISTIC_UUID
+        assert filter_dict["service_uuid"] == SERVICE_UUID
 
 
 async def test_register_retry_callback_static_mac(hass: HomeAssistant) -> None:

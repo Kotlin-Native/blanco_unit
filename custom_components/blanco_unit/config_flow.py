@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 import logging
 import re
+import sys
 from typing import Any
 
 from bleak_retry_connector import BleakClientWithServiceCache, establish_connection
@@ -20,6 +22,7 @@ from homeassistant.helpers.selector import (
     TextSelectorType,
 )
 
+from .bluez_helpers import async_is_device_bonded
 from .client import validate_pin
 from .const import (
     CONF_DEV_ID,
@@ -233,34 +236,80 @@ class BlancoUnitConfigFlow(ConfigFlow, domain=DOMAIN):
         _LOGGER.debug("async_step_user %s", user_input)
         result = ValidationResult(errors={})
         if user_input is not None:
-            result = await self.validate_input(user_input)
-            if not result.errors:
-                # Validation was successful, create a unique id and create the config entry.
-                # Use MAC as unique_id for static MAC, dev_id for random MAC
-                if result.mac_address == RANDOM_MAC_PLACEHOLDER:
-                    await self.async_set_unique_id(result.dev_id)
-                else:
-                    await self.async_set_unique_id(result.mac_address)
-                self._abort_if_unique_id_configured()
+            # Quick format validation before expensive BLE operations
+            mac = user_input.get(CONF_MAC, "")
+            pin_str = str(user_input.get(CONF_PIN, ""))
 
-                # Store MAC address and dev_id in config
-                config_data = user_input.copy()
-                config_data[CONF_MAC] = result.mac_address
-                config_data[CONF_DEV_ID] = result.dev_id
-
-                _LOGGER.debug("Create entry with %s", config_data)
-                # Clean up discovery_info after successful validation
-                self._discovery_info = None
-                return self.async_create_entry(
-                    title=user_input[CONF_NAME],
-                    data=config_data,
+            if not re.match(
+                r"^([0-9A-Fa-f]{2}([-:])){5}([0-9A-Fa-f]{2})$", mac
+            ):
+                result = ValidationResult({CONF_ERROR: "invalid_mac_code"})
+            elif len(pin_str) != 5 or not pin_str.isdigit():
+                result = ValidationResult({CONF_ERROR: "invalid_pin_format"})
+            else:
+                # Determine device address
+                address = (
+                    self._discovery_info.address
+                    if self._discovery_info
+                    else mac
                 )
+
+                # On Linux, ensure BLE bonding before connection attempt.
+                # The device requires bonding for GATT service discovery.
+                # Use the PIN as the pairing passkey automatically.
+                if sys.platform == "linux":
+                    is_bonded = await async_is_device_bonded(address)
+                    if not is_bonded:
+                        _LOGGER.info(
+                            "Device %s is not bonded, pairing with PIN",
+                            address,
+                        )
+                        from .bluez_helpers import async_pair_bluez_device  # noqa: PLC0415
+
+                        paired = await async_pair_bluez_device(address, pin_str)
+                        if not paired:
+                            result = ValidationResult(
+                                {CONF_ERROR: "error_pairing_failed"}
+                            )
+                            return self.async_show_form(
+                                step_id="user",
+                                data_schema=self.prefilledForm(data=user_input),
+                                errors=result.errors,
+                            )
+                        _LOGGER.info("BLE pairing successful for %s", address)
+                        # Let HA bluetooth scanner re-discover the device
+                        await asyncio.sleep(5)
+
+                result = await self.validate_input(user_input)
+                if not result.errors:
+                    return await self._async_create_entry(user_input, result)
 
         return self.async_show_form(
             step_id="user",
             data_schema=self.prefilledForm(data=user_input),
             errors=result.errors,
             description_placeholders=result.description_placeholders,
+        )
+
+    async def _async_create_entry(
+        self, user_input: dict[str, Any], result: ValidationResult
+    ) -> ConfigFlowResult:
+        """Create config entry from successful validation result."""
+        if result.mac_address == RANDOM_MAC_PLACEHOLDER:
+            await self.async_set_unique_id(result.dev_id)
+        else:
+            await self.async_set_unique_id(result.mac_address)
+        self._abort_if_unique_id_configured()
+
+        config_data = user_input.copy()
+        config_data[CONF_MAC] = result.mac_address
+        config_data[CONF_DEV_ID] = result.dev_id
+
+        _LOGGER.debug("Create entry with %s", config_data)
+        self._discovery_info = None
+        return self.async_create_entry(
+            title=user_input[CONF_NAME],
+            data=config_data,
         )
 
     async def async_step_reauth(

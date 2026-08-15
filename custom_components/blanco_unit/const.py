@@ -14,6 +14,10 @@ RANDOM_MAC_PLACEHOLDER = "randomized:mac"
 BLE_CALLBACK = "unregister_ble_callback"
 
 # BLE Protocol Constants
+# Advertised service UUID — this is what the device puts in its BLE
+# advertisement and what HA uses for discovery/scanning. It is NOT the
+# same as CHARACTERISTIC_UUID (which is only used for GATT read/write).
+SERVICE_UUID = "847bba10-a31f-41bf-a35f-3f73a22bb307"
 CHARACTERISTIC_UUID = "3b531d4d-ed58-4677-b2fa-1c72a86082cf"
 MTU_SIZE = 200
 

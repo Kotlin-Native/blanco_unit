@@ -15,7 +15,7 @@ from typing import Any
 
 from bleak import BleakClient
 from bleak.backends.device import BLEDevice
-from bleak_retry_connector import BleakClientWithServiceCache, establish_connection
+from bleak_retry_connector import establish_connection
 
 from .const import CHARACTERISTIC_UUID, MTU_SIZE
 from .data import (
@@ -293,7 +293,8 @@ class _BlancoUnitProtocol:
             _LOGGER.error("JSON parse failed: %s", clean)
             raise ValueError("Failed to parse JSON response") from e
 
-    def extract_pars(self, response: dict[str, Any]) -> dict[str, Any]:
+    @staticmethod
+    def extract_pars(response: dict[str, Any]) -> dict[str, Any]:
         """Extract parameters from response body."""
         body = response.get("body", {})
         if "pars" in body:
@@ -302,37 +303,72 @@ class _BlancoUnitProtocol:
             return body["results"][0].get("pars", {})
         return {}
 
-    def extract_errors(self, response: dict[str, Any]) -> list[dict[str, Any]]:
+    @staticmethod
+    def extract_errors(response: dict[str, Any]) -> list[dict[str, Any]]:
         """Extract error list from response."""
-        pars = self.extract_pars(response)
+        pars = _BlancoUnitProtocol.extract_pars(response)
         return pars.get("errs", [])
 
     async def read_response_chunks(self, client: BleakClient) -> list[bytes]:
         """Read response chunks from the characteristic."""
-        chunks = []
+        chunks: list[bytes] = []
         expected = 1
         last_data = b""
         attempts = 0
-        max_attempts = 40
+        max_attempts = 60
+        consecutive_errors = 0
+        read_start = time.time()
 
         while len(chunks) < expected and attempts < max_attempts:
             try:
                 data = await client.read_gatt_char(CHARACTERISTIC_UUID)
+                consecutive_errors = 0
+                if not data:
+                    attempts += 1
+                    await asyncio.sleep(0.05)
+                    continue
                 if data != last_data:
                     last_data = data
                     chunks.append(data)
                     if data[0] == 0xFF:
                         expected = data[2]
                 attempts += 1
+                await asyncio.sleep(0.05)
             except Exception as e:  # noqa: BLE001
-                _LOGGER.error("Read error: %s", e)
-                break
+                err_str = str(e)
+                if "Not connected" in err_str or "NotConnected" in err_str:
+                    _LOGGER.warning("Read failed (disconnected): %s", e)
+                    break
+                # Transient ATT errors (e.g. 0x0e) mean the device
+                # hasn't prepared its response yet — keep polling.
+                consecutive_errors += 1
+                if consecutive_errors >= 10:
+                    _LOGGER.warning(
+                        "Read failed %d times, giving up: %s",
+                        consecutive_errors, e,
+                    )
+                    break
+                _LOGGER.debug("Transient read error (attempt %d): %s", attempts, e)
+                await asyncio.sleep(0.1)
+                attempts += 1
 
         if len(chunks) != expected:
+            elapsed = time.time() - read_start
+            _LOGGER.warning(
+                "Incomplete BLE response after %d attempts (%.1fs): "
+                "got %d/%d chunks",
+                attempts, elapsed, len(chunks), expected,
+            )
             raise TimeoutError(
-                f"Incomplete response: got {len(chunks)}/{expected} chunks"
+                f"Incomplete response: got {len(chunks)}/{expected} chunks "
+                f"after {attempts} attempts ({elapsed:.1f}s)"
             )
 
+        elapsed = time.time() - read_start
+        _LOGGER.debug(
+            "Read %d/%d chunks in %d attempts (%.1fs)",
+            len(chunks), expected, attempts, elapsed,
+        )
         return chunks
 
     async def send_pairing_request(
@@ -362,6 +398,9 @@ class _BlancoUnitProtocol:
         # Send packets
         for packet in packets:
             await client.write_gatt_char(CHARACTERISTIC_UUID, packet, response=True)
+
+        # Delay to let device process before polling reads
+        await asyncio.sleep(0.3)
 
         # Read response
         chunks = await self.read_response_chunks(client)
@@ -407,6 +446,9 @@ class _BlancoUnitProtocol:
         for packet in packets:
             await client.write_gatt_char(CHARACTERISTIC_UUID, packet, response=True)
 
+        # Delay to let device process before polling reads
+        await asyncio.sleep(0.3)
+
         # Read response
         chunks = await self.read_response_chunks(client)
         return self.parse_response(chunks)
@@ -445,6 +487,10 @@ class BlancoUnitBluetoothClient:
         self._session_data: _BlancoUnitSessionData | None = None
         self._connect_lock = asyncio.Lock()
 
+    def update_device(self, device: BLEDevice) -> None:
+        """Update the BLE device reference with a fresh advertisement."""
+        self._device = device
+
     @property
     def device_id(self) -> str | None:
         """Return the device ID from the current session, or None if not connected."""
@@ -466,49 +512,294 @@ class BlancoUnitBluetoothClient:
 
     async def disconnect(self) -> None:
         """Disconnect from the Blanco Unit BLE device if connected."""
-        if self._session_data:
-            await self._session_data.client.disconnect()
+        await self._clear_session()
+
+    async def _clear_session(self) -> None:
+        """Disconnect the BLE client and reset session state.
+
+        MUST be called instead of just setting _session_data = None,
+        otherwise the orphaned BleakClient keeps a half-dead BlueZ
+        connection alive and subsequent reconnects fail with
+        'Service Discovery has not been performed yet'.
+        """
+        session = self._session_data
+        self._session_data = None
+        if session is not None:
+            _LOGGER.debug(
+                "Clearing session and disconnecting BLE client for %s",
+                self._device.address,
+            )
+            try:
+                await session.client.disconnect()
+            except Exception:  # noqa: BLE001
+                _LOGGER.debug(
+                    "Ignoring error during session disconnect for %s",
+                    self._device.address,
+                )
 
     async def _connect(self) -> _BlancoUnitSessionData:
-        """Connect to the device if not already connected and authenticate."""
+        """Connect to the device if not already connected and authenticate.
+
+        establish_connection already handles BLE-level retries internally,
+        so we only retry here if the *protocol-level* pairing fails after
+        a successful BLE connection (e.g. the device dropped the link
+        during the pairing handshake).
+        """
         async with self._connect_lock:
-            _LOGGER.debug("Connecting to device %s", self._device.address)
             if self._session_data:
-                _LOGGER.debug("Already connected")
+                _LOGGER.debug("Already connected to %s", self._device.address)
                 return self._session_data
 
-            client = await establish_connection(
-                client_class=BleakClientWithServiceCache,
-                device=self._device,
-                name=self._device.name or "Unknown Device",
-                disconnected_callback=self._handle_disconnect,
-                timeout=120,
+            _LOGGER.info(
+                "Connecting to %s (name=%s)",
+                self._device.address,
+                self._device.name or "Unknown",
             )
 
-            # Create protocol instance for this session
-            protocol = _BlancoUnitProtocol(mtu=MTU_SIZE)
+            # Explicitly disconnect any stale BlueZ connection before
+            # attempting a new one.  Without this, BlueZ can hold a
+            # half-open D-Bus link that causes persistent ATT 0x0e
+            # errors until HA is restarted.
+            await self._reset_bluez_connection()
 
-            # Perform initial pairing
-            result = await self._perform_pairing(client, protocol)
+            # Ensure BLE-level bonding — the device requires an encrypted
+            # link before it exposes GATT characteristics.
+            from .bluez_helpers import async_ensure_bonded  # noqa: PLC0415
 
-            _LOGGER.debug(
-                "Connected and paired with device ID: %s, device type: %d",
-                result.dev_id,
-                result.dev_type,
+            await async_ensure_bonded(self._device.address, self._pin)
+
+            connect_start = time.time()
+            last_err: BaseException | None = None
+            for attempt in range(2):
+                client: BleakClient | None = None
+                try:
+                    _LOGGER.debug(
+                        "Connection attempt %d/2 to %s",
+                        attempt + 1, self._device.address,
+                    )
+                    client = await establish_connection(
+                        client_class=BleakClient,
+                        device=self._device,
+                        name=self._device.name or "Unknown Device",
+                        disconnected_callback=self._handle_disconnect,
+                        timeout=30,
+                        ble_device_callback=lambda: self._device,
+                    )
+                    _LOGGER.debug(
+                        "BLE link established to %s, performing pairing",
+                        self._device.address,
+                    )
+
+                    # Create protocol instance for this session
+                    protocol = _BlancoUnitProtocol(mtu=MTU_SIZE)
+
+                    # Perform initial pairing
+                    result = await self._perform_pairing(client, protocol)
+
+                    elapsed = time.time() - connect_start
+                    _LOGGER.info(
+                        "Connected and paired to %s (dev_id=%s, dev_type=%d) in %.1fs",
+                        self._device.address,
+                        result.dev_id,
+                        result.dev_type,
+                        elapsed,
+                    )
+                    self._session_data = _BlancoUnitSessionData(
+                        client=client,
+                        dev_id=result.dev_id,
+                        dev_type=result.dev_type,
+                        protocol=protocol,
+                    )
+                    self._connection_callback(
+                        self._session_data.client.is_connected
+                    )
+                    return self._session_data
+                except BlancoUnitAuthenticationError:
+                    # Wrong PIN — no point retrying
+                    _LOGGER.warning(
+                        "Authentication failed for %s — wrong PIN",
+                        self._device.address,
+                    )
+                    if client is not None:
+                        try:
+                            await client.disconnect()
+                        except Exception:  # noqa: BLE001
+                            pass
+                    raise
+                except (Exception, asyncio.CancelledError) as err:
+                    last_err = err
+                    _LOGGER.warning(
+                        "Connection attempt %d/2 to %s failed: %r",
+                        attempt + 1, self._device.address, err,
+                    )
+                    if client is not None:
+                        try:
+                            await client.disconnect()
+                        except Exception:  # noqa: BLE001
+                            pass
+                    # Longer backoff to let BlueZ fully release resources
+                    await asyncio.sleep(5.0)
+
+            elapsed = time.time() - connect_start
+            _LOGGER.warning(
+                "All connection attempts to %s exhausted after %.1fs: %r",
+                self._device.address, elapsed, last_err,
             )
-            self._session_data = _BlancoUnitSessionData(
-                client=client,
-                dev_id=result.dev_id,
-                dev_type=result.dev_type,
-                protocol=protocol,
-            )
-            self._connection_callback(self._session_data.client.is_connected)
-            return self._session_data
 
-    def _handle_disconnect(self, _: BleakClient) -> None:
+            # Final fallback: the device may be bonded on the host
+            # (BlueZ) but the bond was invalidated on the device side
+            # (e.g. integration was removed and re-added, device was
+            # factory-reset, or re-paired with the Blanco app).  In
+            # that case BLE connects but every GATT operation fails
+            # with encryption / ATT 0x0e errors.  Force-clear the
+            # BlueZ bond and re-pair, then try one more time.
+            if not isinstance(last_err, BlancoUnitAuthenticationError):
+                try:
+                    repaired = await self._force_repair()
+                except Exception:  # noqa: BLE001
+                    _LOGGER.debug(
+                        "Force re-pair raised", exc_info=True
+                    )
+                    repaired = False
+                if repaired:
+                    client = None
+                    try:
+                        _LOGGER.info(
+                            "Retrying connection to %s after forced re-pair",
+                            self._device.address,
+                        )
+                        client = await establish_connection(
+                            client_class=BleakClient,
+                            device=self._device,
+                            name=self._device.name or "Unknown Device",
+                            disconnected_callback=self._handle_disconnect,
+                            timeout=30,
+                            ble_device_callback=lambda: self._device,
+                        )
+                        protocol = _BlancoUnitProtocol(mtu=MTU_SIZE)
+                        result = await self._perform_pairing(client, protocol)
+                        elapsed = time.time() - connect_start
+                        _LOGGER.info(
+                            "Connected and paired to %s after forced "
+                            "re-pair (dev_id=%s, dev_type=%d) in %.1fs",
+                            self._device.address,
+                            result.dev_id,
+                            result.dev_type,
+                            elapsed,
+                        )
+                        self._session_data = _BlancoUnitSessionData(
+                            client=client,
+                            dev_id=result.dev_id,
+                            dev_type=result.dev_type,
+                            protocol=protocol,
+                        )
+                        self._connection_callback(
+                            self._session_data.client.is_connected
+                        )
+                        return self._session_data
+                    except BlancoUnitAuthenticationError:
+                        if client is not None:
+                            try:
+                                await client.disconnect()
+                            except Exception:  # noqa: BLE001
+                                pass
+                        raise
+                    except (Exception, asyncio.CancelledError) as err:
+                        last_err = err
+                        _LOGGER.warning(
+                            "Connection retry after re-pair failed: %r", err
+                        )
+                        if client is not None:
+                            try:
+                                await client.disconnect()
+                            except Exception:  # noqa: BLE001
+                                pass
+
+            raise BlancoUnitConnectionError(
+                f"Failed after 2 connection attempts: {last_err}"
+            )
+
+    async def _force_repair(self) -> bool:
+        """Remove the BlueZ bond for this device and re-pair from scratch.
+
+        Used as a last-resort recovery when the device appears to be
+        bonded on the host but every connect attempt fails (typically
+        because the device-side bond was invalidated outside HA, e.g.
+        the integration was previously removed and re-added).
+        """
+        from .bluez_helpers import (  # noqa: PLC0415
+            async_pair_bluez_device,
+            async_remove_bluez_device,
+        )
+
+        address = self._device.address
+        _LOGGER.warning(
+            "Forcing BlueZ re-pair for %s (clearing stale bond)", address
+        )
+        await async_remove_bluez_device(address)
+        # Give BlueZ time to release resources before re-pairing.
+        await asyncio.sleep(2.0)
+        return await async_pair_bluez_device(address, self._pin)
+
+    async def _reset_bluez_connection(self) -> None:
+        """Disconnect any stale BlueZ connection to this device.
+
+        BlueZ can hold a half-open D-Bus connection after an unclean
+        disconnect.  This causes persistent ATT 0x0e errors on all
+        subsequent connect attempts until HA is restarted.  By
+        explicitly calling Disconnect() on the BlueZ device object
+        we clear the stale state without requiring a restart.
+        """
+        try:
+            await asyncio.wait_for(self._do_reset_bluez(), timeout=5.0)
+        except TimeoutError:
+            _LOGGER.debug("_reset_bluez_connection timed out")
+        except Exception:  # noqa: BLE001
+            pass
+
+    async def _do_reset_bluez(self) -> None:
+        """Perform the actual D-Bus reset call."""
+        from dbus_fast import BusType  # noqa: PLC0415
+        from dbus_fast.aio import MessageBus  # noqa: PLC0415
+
+        address = self._device.address
+        dev_path = (
+            "/org/bluez/hci0/dev_" + address.upper().replace(":", "_")
+        )
+
+        bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+        try:
+            intro = await bus.introspect("org.bluez", dev_path)
+            proxy = bus.get_proxy_object("org.bluez", dev_path, intro)
+            props = proxy.get_interface(
+                "org.freedesktop.DBus.Properties"
+            )
+            connected = await props.call_get(
+                "org.bluez.Device1", "Connected"
+            )
+            if connected.value:
+                _LOGGER.info(
+                    "Clearing stale BlueZ connection to %s", address
+                )
+                device1 = proxy.get_interface("org.bluez.Device1")
+                await device1.call_disconnect()
+                await asyncio.sleep(0.5)
+        finally:
+            bus.disconnect()
+
+    def _handle_disconnect(self, client: BleakClient) -> None:
         """Reset session and call connection callback."""
-        _LOGGER.debug("Device disconnected")
-        self._session_data = None
+        _LOGGER.warning(
+            "Device %s disconnected unexpectedly", self._device.address
+        )
+        # Only clear if this client matches the current session
+        # (avoids clearing a new session established during retry).
+        if (
+            self._session_data is not None
+            and self._session_data.client is client
+        ):
+            _LOGGER.debug("Cleared session for %s", self._device.address)
+            self._session_data = None
         self._connection_callback(False)
 
     async def _perform_pairing(
@@ -544,18 +835,39 @@ class BlancoUnitBluetoothClient:
         """Execute a request-response transaction."""
         session_data = await self._connect()
 
-        response = await session_data.protocol.send_request(
-            client=session_data.client,
-            pin=self._pin,
-            dev_id=session_data.dev_id,
-            dev_type=session_data.dev_type,
-            evt_type=evt_type,
-            ctrl=ctrl,
-            pars=pars,
+        _LOGGER.debug(
+            "Executing transaction evt_type=%d ctrl=%s to %s",
+            evt_type, ctrl, self._device.address,
         )
 
+        try:
+            response = await session_data.protocol.send_request(
+                client=session_data.client,
+                pin=self._pin,
+                dev_id=session_data.dev_id,
+                dev_type=session_data.dev_type,
+                evt_type=evt_type,
+                ctrl=ctrl,
+                pars=pars,
+            )
+        except (Exception, asyncio.CancelledError) as err:
+            # Connection dropped mid-transaction — disconnect the stale
+            # client so BlueZ fully releases the HCI link, then the next
+            # call triggers a clean fresh reconnect.
+            _LOGGER.warning(
+                "Transaction (evt_type=%d, ctrl=%s) failed on %s, "
+                "clearing session: %r",
+                evt_type, ctrl, self._device.address, err,
+            )
+            await self._clear_session()
+            raise
+
         # Check for errors
-        errors = session_data.protocol.extract_errors(response)
+        errors = _BlancoUnitProtocol.extract_errors(response)
+        if errors:
+            _LOGGER.debug(
+                "Transaction response contains errors: %s", errors
+            )
         for error in errors:
             if error.get("err_code") == 4:
                 raise BlancoUnitAuthenticationError(
@@ -571,7 +883,7 @@ class BlancoUnitBluetoothClient:
     async def get_system_info(self) -> BlancoUnitSystemInfo:
         """Read and return system information (firmware versions, device name, reset count)."""
         resp = await self._execute_transaction(evt_type=7, ctrl=3, pars={"evt_type": 2})
-        pars = self._session_data.protocol.extract_pars(resp)
+        pars = _BlancoUnitProtocol.extract_pars(resp)
         return BlancoUnitSystemInfo(
             sw_ver_comm_con=pars.get("sw_ver_comm_con", {}).get("val", "Unknown"),
             sw_ver_elec_con=pars.get("sw_ver_elec_con", {}).get("val", "Unknown"),
@@ -583,7 +895,7 @@ class BlancoUnitBluetoothClient:
     async def get_settings(self) -> BlancoUnitSettings:
         """Read and return device configuration settings."""
         resp = await self._execute_transaction(evt_type=7, ctrl=3, pars={"evt_type": 5})
-        pars = self._session_data.protocol.extract_pars(resp)
+        pars = _BlancoUnitProtocol.extract_pars(resp)
         return BlancoUnitSettings(
             calib_still_wtr=pars.get("calib_still_wtr", {}).get("val", 0),
             calib_soda_wtr=pars.get("calib_soda_wtr", {}).get("val", 0),
@@ -601,7 +913,7 @@ class BlancoUnitBluetoothClient:
     async def get_status(self) -> BlancoUnitStatus:
         """Read and return real-time device status."""
         resp = await self._execute_transaction(evt_type=7, ctrl=3, pars={"evt_type": 6})
-        pars = self._session_data.protocol.extract_pars(resp)
+        pars = _BlancoUnitProtocol.extract_pars(resp)
         return BlancoUnitStatus(
             tap_state=pars.get("tap_state", {}).get("val", 0),
             filter_rest=pars.get("filter_rest", {}).get("val", 0),
@@ -622,7 +934,7 @@ class BlancoUnitBluetoothClient:
     async def get_device_identity(self) -> BlancoUnitIdentity:
         """Read and return device identity (serial number, service code)."""
         resp = await self._execute_transaction(evt_type=7, ctrl=2, pars={})
-        pars = self._session_data.protocol.extract_pars(resp)
+        pars = _BlancoUnitProtocol.extract_pars(resp)
         return BlancoUnitIdentity(
             serial_no=pars.get("ser_no", "Unknown"),
             service_code=pars.get("serv_code", "Unknown"),
@@ -631,7 +943,7 @@ class BlancoUnitBluetoothClient:
     async def get_wifi_info(self) -> BlancoUnitWifiInfo:
         """Read and return WiFi and network information."""
         resp = await self._execute_transaction(evt_type=7, ctrl=10, pars={})
-        pars = self._session_data.protocol.extract_pars(resp)
+        pars = _BlancoUnitProtocol.extract_pars(resp)
         return BlancoUnitWifiInfo(
             cloud_connect=pars.get("cloud_connect", {}).get("val", False),
             ssid=pars.get("ssid", {}).get("val", ""),
@@ -740,8 +1052,6 @@ class BlancoUnitBluetoothClient:
         """
         if not (100 <= amount_ml <= 1500):
             raise ValueError("Amount must be between 100ml and 1500ml")
-        if amount_ml % 100 != 0:
-            raise ValueError("Amount must be a multiple of 100ml")
         if co2_intensity not in (1, 2, 3):
             raise ValueError("CO2 intensity must be 1 (still), 2 (medium), or 3 (high)")
 
@@ -793,7 +1103,7 @@ class BlancoUnitBluetoothClient:
         """
         _LOGGER.info("Scanning for WiFi networks")
         resp = await self._execute_transaction(evt_type=7, ctrl=12, pars={})
-        pars = self._session_data.protocol.extract_pars(resp)
+        pars = _BlancoUnitProtocol.extract_pars(resp)
         aps = pars.get("aps", [])
         return [
             BlancoUnitWifiNetwork(
@@ -875,6 +1185,8 @@ class BlancoUnitBluetoothClient:
             return await self._execute_transaction(
                 evt_type=evt_type, ctrl=ctrl, pars=pars
             )
+        except BlancoUnitAuthenticationError:
+            raise
         except Exception as e:  # noqa: BLE001
             _LOGGER.debug(
                 "Test failed for evt_type=%s, ctrl=%s, pars=%s: %s",
@@ -964,7 +1276,7 @@ async def validate_pin(
     if len(pin) != 5 or not pin.isdigit():
         raise ValueError("PIN must be exactly 5 digits")
 
-    _LOGGER.debug("Validating PIN %s", pin)
+    _LOGGER.debug("Validating PIN")
 
     # Use provided protocol or create new one
     if protocol is None:
@@ -977,7 +1289,7 @@ async def validate_pin(
     dev_type = _extract_device_type(response)
 
     # Check for authentication error (error code 4)
-    errors = protocol.extract_errors(response)
+    errors = _BlancoUnitProtocol.extract_errors(response)
     for error in errors:
         if error.get("err_code") == 4:
             _LOGGER.debug("PIN validation failed: wrong PIN (error code 4)")
